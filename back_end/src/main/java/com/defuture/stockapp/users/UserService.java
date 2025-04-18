@@ -59,94 +59,89 @@ public class UserService {
 		double score = 0;
 		for (InvestmentResponseDTO response : responses) {
 			int questionId = response.getQuestionId();
-			int selectedOption = response.getSelectedOption();
-
-			switch (questionId) {
-			case 1:
-				if (selectedOption == 1) {
-					score += 12.5;
-				} else if (selectedOption == 2) {
-					score += 12.5;
-				} else if (selectedOption == 3) {
-					score += 9.3;
-				} else if (selectedOption == 4) {
-					score += 6.2;
-				} else if (selectedOption == 5) {
-					score += 3.1;
-				}
-				break;
-			case 2:
-				if (selectedOption == 1) {
-					score += 3.1;
-				} else if (selectedOption == 2) {
-					score += 6.2;
-				} else if (selectedOption == 3) {
-					score += 9.3;
-				} else if (selectedOption == 4) {
-					score += 12.5;
-				} else if (selectedOption == 5) {
-					score += 15.6;
-				}
-				break;
-			case 3:
-				if (selectedOption == 1) {
-					score += 3.1;
-				} else if (selectedOption == 2) {
-					score += 6.2;
-				} else if (selectedOption == 3) {
-					score += 9.3;
-				} else if (selectedOption == 4) {
-					score += 12.5;
-				} else if (selectedOption == 5) {
-					score += 15.6;
-				}
-				break;
-			case 4:
-				if (selectedOption == 1) {
-					score += 3.1;
-				} else if (selectedOption == 2) {
-					score += 6.2;
-				} else if (selectedOption == 3) {
-					score += 9.3;
-				} else if (selectedOption == 4) {
-					score += 12.5;
-				}
-				break;
-			case 5:
-				if (selectedOption == 1) {
-					score += 15.6;
-				} else if (selectedOption == 2) {
-					score += 12.5;
-				} else if (selectedOption == 3) {
-					score += 9.3;
-				} else if (selectedOption == 4) {
-					score += 6.2;
-				} else if (selectedOption == 5) {
-					score += 3.1;
-				}
-				break;
-			case 6:
-				if (selectedOption == 1) {
-					score += 9.3;
-				} else if (selectedOption == 2) {
-					score += 6.2;
-				} else if (selectedOption == 3) {
-					score += 3.1;
-				}
-				break;
-			case 7:
-				if (selectedOption == 1) {
-					score += 6.2;
-				} else if (selectedOption == 2) {
-					score += 6.2;
-				} else if (selectedOption == 3) {
-					score += 12.5;
-				} else if (selectedOption == 4) {
-					score += 18.7;
-				}
+			for (int option : response.getSelectedOption()) {
+				score += getScore(questionId, option);
 			}
 		}
 		return score;
+	}
+
+	private double getScore(int questionId, int selectedOption) {
+		switch (questionId) {
+		case 1:
+			if (selectedOption == 1 || selectedOption == 2)
+				return 12.5;
+			if (selectedOption == 3)
+				return 9.3;
+			if (selectedOption == 4)
+				return 6.2;
+			if (selectedOption == 5)
+				return 3.1;
+			break;
+		case 2:
+			if (selectedOption == 1)
+				return 3.1;
+			if (selectedOption == 2)
+				return 6.2;
+			if (selectedOption == 3)
+				return 9.3;
+			if (selectedOption == 4)
+				return 12.5;
+			if (selectedOption == 5)
+				return 15.6;
+			break;
+		case 3:
+			if (selectedOption == 1)
+				return 3.1;
+			if (selectedOption == 2)
+				return 6.2;
+			if (selectedOption == 3)
+				return 9.3;
+			if (selectedOption == 4)
+				return 12.5;
+			if (selectedOption == 5)
+				return 15.6;
+			break;
+		case 4:
+			if (selectedOption == 1)
+				return 3.1;
+			if (selectedOption == 2)
+				return 6.2;
+			if (selectedOption == 3)
+				return 9.3;
+			if (selectedOption == 4)
+				return 12.5;
+			break;
+		case 5:
+			if (selectedOption == 1)
+				return 15.6;
+			if (selectedOption == 2)
+				return 12.5;
+			if (selectedOption == 3)
+				return 9.3;
+			if (selectedOption == 4)
+				return 6.2;
+			if (selectedOption == 5)
+				return 3.1;
+			break;
+		case 6:
+			if (selectedOption == 1)
+				return 9.3;
+			if (selectedOption == 2)
+				return 6.2;
+			if (selectedOption == 3)
+				return 3.1;
+			break;
+		case 7:
+			if (selectedOption == 1 || selectedOption == 2)
+				return 6.2;
+			if (selectedOption == 3)
+				return 12.5;
+			if (selectedOption == 4)
+				return 18.7;
+			break;
+		}
+		return 0;
 	}
 
 	private String determineInvestmentType(double totalScore) {

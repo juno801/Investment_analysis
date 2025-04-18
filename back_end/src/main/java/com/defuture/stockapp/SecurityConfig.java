@@ -34,7 +34,7 @@ public class SecurityConfig {
 		http.csrf(csrf -> csrf.disable())
 				.authorizeHttpRequests(authorize -> authorize
 						.requestMatchers("/api/users/login", "/api/users/register", "/api/users/exists/{userId}",
-								"/api/users/{userId}", "/api/account/evaluation")
+								"/api/users/{userId}")
 						.permitAll().anyRequest().authenticated())
 				// 세션 관리를 stateless로 설정
 				.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
