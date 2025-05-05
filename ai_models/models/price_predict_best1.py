@@ -18,9 +18,34 @@ from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator, ROCIndicator
 from ta.volatility import BollingerBands
 import os
-from google.colab import drive
-drive.mount('/content/drive')
+import pickle
+import json
+import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
+import logging
+from ai_models.database.db_config import execute_query, execute_values_query, execute_transaction
 
+# TensorFlow 로깅 설정
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all, 1=no info, 2=no warnings, 3=no errors
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+# GPU 사용 가능 여부 확인 및 최적화
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPU 사용 가능: {gpus[0]}")
+    try:
+        # GPU 메모리 설정 (메모리 성장 대신 고정된 메모리 할당 사용)
+        for gpu in gpus:
+            # 메모리 제한 설정 (90% 사용)
+            tf.config.experimental.set_virtual_device_configuration(
+                gpu,
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=1024*9)]  # 9GB
+            )
+    except RuntimeError as e:
+        print(f"GPU 메모리 설정 중 오류: {e}")
+else:
+    print("GPU를 찾을 수 없습니다. CPU를 사용합니다.")
 
 print("TensorFlow 버전:", tf.__version__)
 
@@ -44,37 +69,107 @@ SEED = 42
 os.environ['PYTHONHASHSEED'] = str(SEED)
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
-os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
 # 모든 랜덤 시드 설정
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 random.seed(SEED)
 
-# GPU 설정 (사용 가능한 경우)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        # 단일 GPU만 사용
-        tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
-        # GPU 메모리 제한 설정
-        tf.config.set_logical_device_configuration(
-            gpus[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=1024*8)]  # 8GB로 제한
-        )
-        logical_gpus = tf.config.list_logical_devices('GPU')
-        print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
-    except RuntimeError as e:
-        print(e)
+# 배치 크기 증가 (GPU 메모리에 맞게 조정)
+BATCH_SIZE = 128  # 32에서 128로 증가
 
-# 배치 크기 고정
-BATCH_SIZE = 32
+def create_predictions_table():
+    """예측 결과를 저장할 테이블 생성"""
+    queries = [
+        ("""
+        CREATE TABLE IF NOT EXISTS price_predictions (
+            id SERIAL PRIMARY KEY,
+            stock_code VARCHAR(10) NOT NULL,
+            stock_name VARCHAR(50) NOT NULL,
+            prediction_date TIMESTAMPTZ NOT NULL,
+            target_date TIMESTAMPTZ NOT NULL,
+            predicted_price DECIMAL(10,2) NOT NULL,
+            actual_price DECIMAL(10,2),
+            prediction_error DECIMAL(10,2),
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """, None),
+        ("CREATE INDEX IF NOT EXISTS idx_price_predictions_date ON price_predictions (prediction_date, target_date);", None),
+        ("CREATE INDEX IF NOT EXISTS idx_price_predictions_stock ON price_predictions (stock_code);", None)
+    ]
+    execute_transaction(queries)
+    print("Price predictions table created successfully!")
+
+def load_data_from_db():
+    """데이터베이스에서 데이터 로드"""
+    print("Loading stock data...")
+    try:
+        # 주가 데이터 로드
+        query = """
+        SELECT 
+            time, stock_code, stock_name,
+            open_price, high_price, low_price, close_price,
+            volume, market_cap, foreign_holding, foreign_holding_ratio
+        FROM stock_prices
+        WHERE stock_name = 'LG전자'
+        ORDER BY time;
+        """
+        stock_data = pd.DataFrame(execute_query(query))
+        
+        # 감성 데이터 로드
+        query = """
+        SELECT 
+            pub_date, title,
+            finbert_positive, finbert_negative, finbert_neutral,
+            finbert_sentiment
+        FROM news_sentiment
+        ORDER BY pub_date;
+        """
+        sentiment_data = pd.DataFrame(execute_query(query))
+        
+        # 경제지표 데이터 로드
+        query = """
+        SELECT 
+            time,
+            treasury_10y, dollar_index, usd_krw, korean_bond_10y
+        FROM economic_indicators
+        ORDER BY time;
+        """
+        economic_data = pd.DataFrame(execute_query(query))
+        
+        print("Stock data shape:", stock_data.shape)
+        print("Sentiment data shape:", sentiment_data.shape)
+        print("Economic data shape:", economic_data.shape)
+        
+        return stock_data, sentiment_data, economic_data
+        
+    except Exception as e:
+        print(f"데이터 로드 중 오류 발생: {e}")
+        raise
+
+def save_prediction(stock_code, stock_name, prediction_date, target_date, predicted_price, actual_price=None):
+    """예측 결과를 데이터베이스에 저장"""
+    prediction_error = None
+    if actual_price is not None:
+        prediction_error = predicted_price - actual_price
+    
+    query = """
+    INSERT INTO price_predictions (
+        stock_code, stock_name, prediction_date, target_date,
+        predicted_price, actual_price, prediction_error
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (
+        stock_code, stock_name, prediction_date, target_date,
+        predicted_price, actual_price, prediction_error
+    )
+    execute_query(query, params, fetch=False)
 
 # 1. 데이터 로드 및 전처리
 print("Loading stock data...")
 try:
     # 데이터 로딩 시 정렬 보장
-    stock_data = pd.read_csv('/content/drive/MyDrive/kospi200_stock_prices_pykrx_20231107_20250321_20250407.csv')
+    stock_data = pd.read_csv('/kaggle/input/dataset/kospi200_stock_prices_pykrx_20231107_20250321_20250407.csv')
     stock_data = stock_data.sort_values(['종목명', '기준일자']).reset_index(drop=True)
 
     print("Stock data columns:", stock_data.columns.tolist())
@@ -87,7 +182,7 @@ except Exception as e:
 print("\nLoading sentiment data...")
 try:
     # 감성 데이터도 정렬 보장
-    sentiment_data = pd.read_excel('/content/drive/MyDrive/lg_news_finbert_sentiment.xlsx')
+    sentiment_data = pd.read_excel('/kaggle/input/dataset/lg_news_finbert_sentiment.xlsx')
     sentiment_data = sentiment_data.sort_values('PubDate').reset_index(drop=True)
 
     print("Sentiment data columns:", sentiment_data.columns.tolist())
@@ -95,6 +190,41 @@ try:
     print("Sentiment data head:\n", sentiment_data.head())
 except Exception as e:
     print(f"감성 데이터 로드 실패: {e}")
+    raise
+
+print("\nLoading economic indicators data...")
+try:
+    # 미국 10년물 국채 금리
+    treasury = yf.download('^TNX', start='2023-11-07', end='2025-03-21')
+    treasury = treasury[['Close']].rename(columns={'Close': 'treasury_10y'})
+    
+    # 달러 인덱스
+    dollar_index = yf.download('DX-Y.NYB', start='2023-11-07', end='2025-03-21')
+    dollar_index = dollar_index[['Close']].rename(columns={'Close': 'dollar_index'})
+    
+    # 원달러 환율
+    usdkrw = yf.download('USDKRW=X', start='2023-11-07', end='2025-03-21')
+    usdkrw = usdkrw[['Close']].rename(columns={'Close': 'usd_krw'})
+    
+    # 한국 10년물 국채 금리 (yfinance 사용)
+    korean_bond = yf.download('KR10YT=RR', start='2023-11-07', end='2025-03-21')
+    korean_bond = korean_bond[['Close']].rename(columns={'Close': 'korean_bond_10y'})
+    
+    # 모든 경제지표 병합
+    economic_data = pd.concat([treasury, dollar_index, usdkrw, korean_bond], axis=1)
+    
+    # MultiIndex 문제 해결
+    if isinstance(economic_data.columns, pd.MultiIndex):
+        economic_data.columns = economic_data.columns.get_level_values(0)
+    
+    # 결측치 처리
+    economic_data = economic_data.ffill().bfill()
+    
+    print("Economic indicators data columns:", economic_data.columns.tolist())
+    print("Economic indicators data shape:", economic_data.shape)
+    print("Economic indicators data head:\n", economic_data.head())
+except Exception as e:
+    print(f"경제지표 데이터 로드 실패: {e}")
     raise
 
 # LG전자 데이터만 필터링
@@ -105,9 +235,11 @@ print("LG data head:\n", lg_data.head())
 # 날짜 형식 변환
 lg_data['기준일자'] = pd.to_datetime(lg_data['기준일자'])
 sentiment_data['PubDate'] = pd.to_datetime(sentiment_data['PubDate'])
+economic_data.index = pd.to_datetime(economic_data.index)
 
 # 데이터 병합
 merged_data = pd.merge(lg_data, sentiment_data, left_on='기준일자', right_on='PubDate', how='left')
+merged_data = pd.merge(merged_data, economic_data, left_on='기준일자', right_index=True, how='left')
 print("\nMerged data shape:", merged_data.shape)
 
 # 기술적 지표 추가
@@ -151,130 +283,262 @@ merged_data = add_technical_indicators(merged_data)
 # 결측치 처리
 merged_data = merged_data.fillna(method='ffill').fillna(method='bfill').fillna(0)
 
+# 데이터 전처리 개선
+def enhanced_preprocessing(df):
+    # 가격 변동률 계산
+    df['price_change'] = df['현재가'].pct_change()
+    df['price_volatility'] = df['price_change'].rolling(window=5).std()
+    
+    # 거래량 변동률
+    df['volume_change'] = df['거래량'].pct_change()
+    df['volume_volatility'] = df['volume_change'].rolling(window=5).std()
+    
+    # 가격 모멘텀
+    df['price_momentum'] = df['현재가'] / df['현재가'].rolling(window=5).mean() - 1
+    
+    # 거래량 모멘텀
+    df['volume_momentum'] = df['거래량'] / df['거래량'].rolling(window=5).mean() - 1
+    
+    # 가격 변동 추세
+    df['price_trend'] = df['현재가'].rolling(window=5).apply(lambda x: np.polyfit(range(len(x)), x, 1)[0])
+    
+    # 이상치 처리 (IQR 방법)
+    for col in ['현재가', '거래량', 'price_change', 'volume_change']:
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        df[col] = df[col].clip(lower_bound, upper_bound)
+    
+    # 결측치 처리 (최신 pandas 방식)
+    df = df.ffill().bfill()
+    
+    # 감성 데이터 보간
+    sentiment_cols = ['finbert_positive', 'finbert_negative', 'finbert_neutral']
+    for col in sentiment_cols:
+        if col in df.columns:
+            # 감성 데이터가 있는 경우에만 보간
+            mask = df[col] != 0
+            if mask.any():
+                df[col] = df[col].interpolate(method='linear')
+    
+    # 경제 지표 보간
+    economic_cols = ['treasury_10y', 'dollar_index', 'usd_krw', 'korean_bond_10y']
+    for col in economic_cols:
+        if col in df.columns:
+            # 경제 지표가 있는 경우에만 보간
+            mask = df[col] != 0
+            if mask.any():
+                df[col] = df[col].interpolate(method='linear')
+    
+    return df
+
+# 데이터 전처리 적용
+merged_data = enhanced_preprocessing(merged_data)
+
 # 스케일링 클래스 개선
-class PriceScaler:
+class EnhancedPriceScaler:
     def __init__(self):
-        self.price_scaler = RobustScaler()  # 이상치에 강건한 스케일러 사용
-        self.feature_scaler = RobustScaler()
+        self.price_scaler = MinMaxScaler(feature_range=(0.1, 0.9))  # 0-1 범위를 벗어나지 않도록 조정
+        self.feature_scaler = MinMaxScaler(feature_range=(0.1, 0.9))
 
     def fit_transform(self, data, price_cols):
         data_copy = data.copy()
-
+        
         # 문자열 컬럼과 날짜 컬럼 제외
         exclude_cols = ['기준일자', '종목코드', '종목명', 'Title', 'PubDate', 'finbert_sentiment']
         for col in exclude_cols:
             if col in data_copy.columns:
                 data_copy = data_copy.drop(columns=[col])
-
+        
         # 가격 데이터와 다른 특성 분리
         price_data = data_copy[price_cols]
         other_data = data_copy.drop(columns=price_cols)
-
+        
         # 각각 스케일링
         scaled_price = self.price_scaler.fit_transform(price_data)
         scaled_other = self.feature_scaler.fit_transform(other_data)
-
+        
         # 스케일링된 데이터 결합
         scaled_data = np.concatenate([scaled_price, scaled_other], axis=1)
         scaled_df = pd.DataFrame(scaled_data, columns=price_cols + other_data.columns.tolist())
-
+        
+        # 원래 컬럼 순서 복원
+        scaled_df = scaled_df[data_copy.columns]
+        
         return scaled_df
 
     def inverse_transform_price(self, scaled_price):
         if len(scaled_price.shape) == 1:
             scaled_price = scaled_price.reshape(-1, 1)
-
+        
         dummy_data = np.zeros((scaled_price.shape[0], len(self.price_scaler.feature_names_in_)))
         dummy_data[:, 0] = scaled_price.flatten()
-
+        
         unscaled = self.price_scaler.inverse_transform(dummy_data)
         return unscaled[:, 0]
 
-# 손실 함수 재설계
-def weighted_time_mse(y_true, y_pred):
-    # 시간 가중치 조정 (첫날 가중치 증가)
+# 손실 함수 개선
+def enhanced_weighted_time_mse(y_true, y_pred):
+    # 수치적 안정성을 위한 작은 값 추가
+    epsilon = 1e-7
+    
+    # 시간 가중치 조정 (첫날 가중치 강화)
     time_weights = tf.constant([0.6, 0.2, 0.1, 0.07, 0.03], dtype=tf.float32)
-
+    
     # 기본 MSE
-    mse_per_step = tf.reduce_mean(tf.square(y_true - y_pred), axis=0)
-
-    # 과대 예측 패널티 (예측값이 실제값보다 클 때 더 큰 패널티)
+    mse_per_step = tf.reduce_mean(tf.square(y_true - y_pred) + epsilon, axis=0)
+    
+    # 과대 예측 패널티 (첫날 강화)
     overprediction_penalty = tf.reduce_mean(
-        tf.maximum(0.0, y_pred - y_true) * 3.0  # 과대 예측에 3배 패널티
+        tf.maximum(0.0, y_pred - y_true) * tf.constant([25.0, 15.0, 10.0, 8.0, 5.0], dtype=tf.float32)
     )
-
-    # 추세 손실 (가중치 증가)
+    
+    # 과소 예측 패널티 (첫날 강화)
+    underprediction_penalty = tf.reduce_mean(
+        tf.maximum(0.0, y_true - y_pred) * tf.constant([15.0, 8.0, 6.0, 4.0, 3.0], dtype=tf.float32)
+    )
+    
+    # 추세 손실 (첫날 강화)
     y_true_diff = y_true[:, 1:] - y_true[:, :-1]
     y_pred_diff = y_pred[:, 1:] - y_pred[:, :-1]
-    trend_loss = tf.reduce_mean(tf.square(y_true_diff - y_pred_diff))
-
-    # 방향성 손실 (가중치 증가)
-    direction_loss = tf.reduce_mean(tf.square(tf.sign(y_true_diff) - tf.sign(y_pred_diff)))
-
+    trend_weights = tf.constant([0.5, 0.3, 0.15, 0.05], dtype=tf.float32)
+    trend_loss = tf.reduce_mean(tf.square(y_true_diff - y_pred_diff) * trend_weights + epsilon)
+    
+    # 방향성 손실 (첫날 강화)
+    direction_weights = tf.constant([0.5, 0.3, 0.15, 0.05], dtype=tf.float32)
+    direction_loss = tf.reduce_mean(
+        tf.square(tf.sign(y_true_diff) - tf.sign(y_pred_diff)) * direction_weights + epsilon
+    )
+    
     # 가중치 적용
     weighted_loss = (
         tf.reduce_sum(mse_per_step * time_weights) +
-        0.15 * overprediction_penalty +  # 과대 예측 패널티 증가
-        0.05 * trend_loss +  # 추세 손실 가중치 증가
-        0.03 * direction_loss  # 방향성 손실 가중치 증가
+        0.7 * overprediction_penalty +
+        0.5 * underprediction_penalty +
+        0.4 * trend_loss +
+        0.3 * direction_loss
     )
     return weighted_loss
 
-# 모델 구조 재설계
-def build_model(input_shape, output_days=5):
+# 데이터 증강 함수 개선
+def augment_data(X, y, noise_level=0.01):
+    """데이터에 노이즈를 추가하여 증강"""
+    X_aug = X.copy()
+    y_aug = y.copy()
+    
+    # 가우시안 노이즈 추가
+    noise = np.random.normal(0, noise_level, X.shape)
+    X_aug = X_aug + noise
+    
+    # 시계열 특성 보존을 위한 노이즈 제한
+    X_aug = np.clip(X_aug, X.min(), X.max())
+    
+    return X_aug, y_aug
+
+# 모델 구조 개선
+def build_enhanced_model(input_shape, output_days=5):
     inputs = Input(shape=input_shape)
-
-    # 시계열 특성 추출을 위한 Conv1D 레이어 추가
-    x = Conv1D(32, 3, padding='same', activation='relu')(inputs)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-
-    # GRU 레이어
-    x = tf.keras.layers.RNN(
-        MCI_GRU_Cell(32),
-        return_sequences=True
+    
+    # 1. 입력 정규화 레이어
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(inputs)
+    x = Dropout(0.2)(x)
+    
+    # 2. Conv1D 레이어
+    x = Conv1D(64, 3, padding='same', activation='relu')(x)
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+    x = Dropout(0.2)(x)
+    
+    # 3. LSTM 레이어
+    x = tf.keras.layers.Bidirectional(
+        tf.keras.layers.LSTM(64, return_sequences=True, recurrent_dropout=0.1)
     )(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.4)(x)
-
-    # Attention 메커니즘 추가
-    attention = MultiHeadAttention(num_heads=4, key_dim=32)(x, x)
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+    x = Dropout(0.2)(x)
+    
+    # 4. Attention 메커니즘
+    attention = MultiHeadAttention(num_heads=8, key_dim=64)(x, x)
     x = tf.keras.layers.Add()([x, attention])
-    x = BatchNormalization()(x)
-    x = Dropout(0.4)(x)
-
-    # 시퀀스 처리
-    x = TimeDistributed(Dense(16, activation='relu'))(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.5)(x)
-
-    # 각 예측 일자별 독립적인 출력 레이어
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+    x = Dropout(0.2)(x)
+    
+    # 5. 출력 레이어
     outputs = []
     for i in range(output_days):
-        day_output = Dense(16, activation='relu')(x[:, -1, :])
-        day_output = BatchNormalization()(day_output)
-        day_output = Dense(1, activation='linear', name=f'day_{i+1}_output')(day_output)
+        day_output = TimeDistributed(Dense(32, activation='relu'))(x)
+        day_output = BatchNormalization(momentum=0.9, epsilon=1e-5)(day_output)
+        day_output = Dropout(0.2)(day_output)
+        day_output = Dense(1, activation='sigmoid', name=f'day_{i+1}_output')(day_output[:, -1, :])  # sigmoid 활성화 함수 사용
         outputs.append(day_output)
-
-    final_output = Concatenate()(outputs)
-
+    
+    final_output = tf.keras.layers.Concatenate()(outputs)
+    
     # 모델 생성
     model = Model(inputs=inputs, outputs=final_output)
-
-    # 컴파일 (학습률 감소)
+    
+    # 학습률 스케줄링
+    initial_learning_rate = 0.0001
+    
     optimizer = AdamW(
-        learning_rate=0.000001,  # 학습률 더 감소
-        weight_decay=0.03,  # 가중치 감소 더 증가
+        learning_rate=initial_learning_rate,
+        weight_decay=0.01,
         beta_1=0.9,
         beta_2=0.999,
-        epsilon=1e-07,
-        amsgrad=False
+        epsilon=1e-07
     )
-    model.compile(optimizer=optimizer,
-                 loss=weighted_time_mse,
-                 metrics=['mae', 'mse'])
-
+    
+    model.compile(
+        optimizer=optimizer,
+        loss=enhanced_weighted_time_mse,
+        metrics=['mae', 'mse']
+    )
+    
     return model
+
+# 학습 과정 개선
+def train_enhanced_model(model, X_train, y_train, X_test, y_test):
+    # 콜백 정의
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=15,
+            restore_best_weights=True,
+            min_delta=0.0001
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-7,
+            min_delta=0.0001
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            '/kaggle/working/best_model.keras',
+            monitor='val_loss',
+            save_best_only=True,
+            save_weights_only=False
+        ),
+        tf.keras.callbacks.LearningRateScheduler(
+            lambda epoch: 0.0001 * (0.95 ** (epoch // 3))
+        )
+    ]
+    
+    # 데이터 증강 적용
+    X_train_aug, y_train_aug = augment_data(X_train, y_train, noise_level=0.01)
+    
+    # 학습
+    history = model.fit(
+        X_train_aug, y_train_aug,
+        validation_data=(X_test, y_test),
+        epochs=150,
+        batch_size=BATCH_SIZE,
+        callbacks=callbacks,
+        verbose=1,
+        shuffle=True
+    )
+    
+    return history
 
 # 데이터 분석
 print("\n[데이터 분석]")
@@ -291,6 +555,9 @@ price_features = ['시가', '고가', '저가', '현재가', '거래량']
 sentiment_features = [
     'finbert_positive', 'finbert_negative', 'finbert_neutral'
 ]
+economic_features = [
+    'treasury_10y', 'dollar_index', 'usd_krw', 'korean_bond_10y'
+]
 technical_features = [
     'RSI', 'MACD', 'MACD_SIGNAL', 'MACD_HIST',
     'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'BB_PERCENT',
@@ -302,12 +569,14 @@ technical_features = [
 # 단기 예측을 위한 특성과 장기 예측을 위한 특성 구분
 short_term_features = price_features + [
     'RSI', 'VOLUME_RATIO', 'MOM', 'ROC',
-    'MA5', 'BB_PERCENT', 'MACD'
+    'MA5', 'BB_PERCENT', 'MACD',
+    'treasury_10y', 'usd_krw'  # 단기 예측에 중요한 경제지표
 ]
 
 long_term_features = price_features + [
     'MA20', 'MA60', 'BB_PERCENT',
-    'MACD', 'MACD_HIST', 'VOLUME_MA20'
+    'MACD', 'MACD_HIST', 'VOLUME_MA20',
+    'treasury_10y', 'dollar_index', 'korean_bond_10y'  # 장기 예측에 중요한 경제지표
 ]
 
 # 공통 특성
@@ -333,50 +602,45 @@ for col in all_features:
         merged_data[col] = np.nan_to_num(merged_data[col], nan=0.0, posinf=0.0, neginf=0.0)
 
 # 스케일링 및 역스케일링을 위한 클래스 수정
-class PriceScaler:
+class EnhancedPriceScaler:
     def __init__(self):
-        self.price_scaler = MinMaxScaler(feature_range=(0, 1))  # 스케일링 범위 확장
-        self.feature_scaler = MinMaxScaler(feature_range=(0, 1))
+        self.price_scaler = MinMaxScaler(feature_range=(0.1, 0.9))  # 0-1 범위를 벗어나지 않도록 조정
+        self.feature_scaler = MinMaxScaler(feature_range=(0.1, 0.9))
 
     def fit_transform(self, data, price_cols):
-        # 데이터 복사
         data_copy = data.copy()
-
+        
         # 문자열 컬럼과 날짜 컬럼 제외
         exclude_cols = ['기준일자', '종목코드', '종목명', 'Title', 'PubDate', 'finbert_sentiment']
         for col in exclude_cols:
             if col in data_copy.columns:
                 data_copy = data_copy.drop(columns=[col])
-
+        
         # 가격 데이터와 다른 특성 분리
         price_data = data_copy[price_cols]
         other_data = data_copy.drop(columns=price_cols)
-
+        
         # 각각 스케일링
         scaled_price = self.price_scaler.fit_transform(price_data)
         scaled_other = self.feature_scaler.fit_transform(other_data)
-
+        
         # 스케일링된 데이터 결합
         scaled_data = np.concatenate([scaled_price, scaled_other], axis=1)
-
-        # 컬럼 이름 복원
         scaled_df = pd.DataFrame(scaled_data, columns=price_cols + other_data.columns.tolist())
-
+        
+        # 원래 컬럼 순서 복원
+        scaled_df = scaled_df[data_copy.columns]
+        
         return scaled_df
 
     def inverse_transform_price(self, scaled_price):
-        # 예측값이 1차원인 경우 2차원으로 변환
         if len(scaled_price.shape) == 1:
             scaled_price = scaled_price.reshape(-1, 1)
-
-        # 더미 데이터 생성 (현재가 컬럼만 사용)
+        
         dummy_data = np.zeros((scaled_price.shape[0], len(self.price_scaler.feature_names_in_)))
-        dummy_data[:, 0] = scaled_price.flatten()  # 현재가 컬럼에 예측값 할당
-
-        # 역변환 수행
+        dummy_data[:, 0] = scaled_price.flatten()
+        
         unscaled = self.price_scaler.inverse_transform(dummy_data)
-
-        # 현재가 컬럼만 반환
         return unscaled[:, 0]
 
 # 데이터 전처리 수정
@@ -390,7 +654,7 @@ try:
     other_cols = [col for col in merged_data.columns if col not in price_cols + exclude_cols]
 
     # 스케일러 초기화 및 적용
-    scaler = PriceScaler()
+    scaler = EnhancedPriceScaler()
     data_scaled = scaler.fit_transform(merged_data, price_cols)
 
     # 스케일링된 데이터를 DataFrame으로 변환
@@ -627,174 +891,213 @@ class MCI_GRU_Cell(Layer):
         })
         return config
 
-# 모델 학습
+# 앙상블 모델 클래스 개선
+class EnsembleModel:
+    def __init__(self, input_shape, n_models=3):
+        self.models = []
+        self.input_shape = input_shape
+        self.n_models = n_models
+        self.model_weights = None
+        
+    def build_models(self):
+        for i in range(self.n_models):
+            model = build_enhanced_model(self.input_shape)
+            self.models.append(model)
+    
+    def train(self, X_train, y_train, X_val, y_val):
+        histories = []
+        val_losses = []
+        
+        # 각 모델 학습
+        for i, model in enumerate(self.models):
+            print(f"\nTraining model {i+1}/{self.n_models}")
+            
+            # 데이터 증강 강화
+            X_train_aug, y_train_aug = augment_data(X_train, y_train, noise_level=0.01 * (i + 1))
+            
+            history = train_enhanced_model(model, X_train_aug, y_train_aug, X_val, y_val)
+            histories.append(history)
+            
+            # 검증 손실 저장
+            val_loss = min(history.history['val_loss'])
+            val_losses.append(val_loss)
+        
+        # 모델 가중치 계산 (검증 손실 기반)
+        val_losses = np.array(val_losses)
+        self.model_weights = 1.0 / (val_losses + 1e-7)
+        self.model_weights = self.model_weights / np.sum(self.model_weights)
+        
+        return histories
+    
+    def predict(self, X):
+        predictions = []
+        for i, model in enumerate(self.models):
+            pred = model.predict(X)
+            predictions.append(pred * self.model_weights[i])
+        return np.sum(predictions, axis=0)
+
+# 앙상블 모델 사용
+ensemble = EnsembleModel(input_shape=(X_train.shape[1], X_train.shape[2]))
+ensemble.build_models()
+histories = ensemble.train(X_train, y_train, X_test, y_test)
+
+# 예측 수행
+predictions = ensemble.predict(X_test)
+
+# 학습 결과 시각화
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(histories[0].history['loss'], label='Training Loss')
+plt.plot(histories[0].history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(histories[0].history['mae'], label='Training MAE')
+plt.plot(histories[0].history['val_mae'], label='Validation MAE')
+plt.title('Model MAE')
+plt.xlabel('Epoch')
+plt.ylabel('MAE')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# 모델 저장
+for i, model in enumerate(ensemble.models):
+    model.save(f'/kaggle/working/stock_prediction_model_{i+1}.keras')  # .h5 대신 .keras 사용
+    
+# 스케일러 저장
+with open(f'/kaggle/working/stock_prediction_scaler_{i+1}.pkl', 'wb') as f:
+    pickle.dump(scaler, f)
+    
+# 모델 메타데이터 저장
+model_metadata = {
+    'input_shape': X_train.shape[1:],
+    'output_days': 5,
+    'price_scaler_params': {
+        'scale_': scaler.price_scaler.scale_.tolist(),
+        'min_': scaler.price_scaler.min_.tolist(),  # center_ 대신 min_ 사용
+        'data_min_': scaler.price_scaler.data_min_.tolist(),
+        'data_max_': scaler.price_scaler.data_max_.tolist(),
+        'data_range_': scaler.price_scaler.data_range_.tolist()
+    }
+}
+    
+with open(f'/kaggle/working/model_metadata_{i+1}.json', 'w') as f:
+    json.dump(model_metadata, f)
+        
+print(f"모델 {i+1} 저장 완료")
+print(f"스케일러 {i+1} 저장 완료")
+print(f"메타데이터 {i+1} 저장 완료")
+
+# 예측 결과 분석 및 시각화
 try:
-    # 모델 생성
-    model = build_model(input_shape=(X_train.shape[1], X_train.shape[2]))
-    print(model.summary())
+    # 테스트 데이터에 대한 예측 수행
+    predictions = ensemble.predict(X_test)
 
-    # 콜백 정의
-    callbacks = [
-        EarlyStopping(monitor='val_loss', patience=40, restore_best_weights=True),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=20, min_lr=1e-8)
-    ]
+    # 마지막 예측 결과 가져오기 (가장 최근 예측)
+    last_prediction = predictions[-1]
 
-    # 배치 크기 조정
-    BATCH_SIZE = 4  # 배치 크기 더 감소
+    # 예측 결과를 원래 스케일로 변환
+    last_prediction = scaler.inverse_transform_price(last_prediction.reshape(-1, 1)).flatten()
 
-    # 모델 학습
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_test, y_test),
-        epochs=500,  # 에포크 수 더 증가
-        batch_size=BATCH_SIZE,
-        callbacks=callbacks,
-        verbose=1,
-        shuffle=True
-    )
+    # 실제 값과 예측 값 비교
+    target_dates = ['2025-03-24', '2025-03-25', '2025-03-26', '2025-03-27', '2025-03-28']
+    target_prices = [69700, 67500, 67200, 66800, 65700]
 
-    # 학습 결과 시각화
-    plt.figure(figsize=(12, 4))
+    # 예측 결과 시각화
+    plt.figure(figsize=(12, 6))
 
-    plt.subplot(1, 2, 1)
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.title('Model Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
+    # 날짜를 datetime 객체로 변환
+    dates = [datetime.strptime(date, '%Y-%m-%d') for date in target_dates]
 
-    plt.subplot(1, 2, 2)
-    plt.plot(history.history['mae'], label='Training MAE')
-    plt.plot(history.history['val_mae'], label='Validation MAE')
-    plt.title('Model MAE')
-    plt.xlabel('Epoch')
-    plt.ylabel('MAE')
-    plt.legend()
+    # 실제 가격과 예측 가격 플롯
+    plt.plot(dates, target_prices, 'b-', label='실제 가격', marker='o')
+    plt.plot(dates, last_prediction, 'r--', label='예측 가격', marker='s')
+
+    # 그래프 스타일링
+    plt.title('LG전자 주가 예측 결과 (2025년 3월)', fontsize=14)
+    plt.xlabel('날짜', fontsize=12)
+    plt.ylabel('주가 (원)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+
+    # x축 날짜 포맷 설정
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator())
+    plt.xticks(rotation=45)
+
+    # 오차율 계산 및 표시
+    error_rates = [(pred - actual) / actual * 100 for pred, actual in zip(last_prediction, target_prices)]
+    for i, (date, error) in enumerate(zip(dates, error_rates)):
+        plt.annotate(f'{error:.2f}%',
+                    xy=(date, max(last_prediction[i], target_prices[i])),
+                    xytext=(0, 10),
+                    textcoords='offset points',
+                    ha='center',
+                    fontsize=10)
 
     plt.tight_layout()
     plt.show()
 
-    # 예측 결과 분석 및 시각화
-    try:
-        # 테스트 데이터에 대한 예측 수행
-        predictions = model.predict(X_test)
+    # 예측 결과 상세 분석
+    print("\n[예측 결과 분석]")
+    print(f"{'날짜':<12} {'실제 가격':>10} {'예측 가격':>10} {'오차율':>8}")
+    print("-" * 45)
+    for date, actual, pred, error in zip(target_dates, target_prices, last_prediction, error_rates):
+        print(f"{date:<12} {actual:>10,d} {pred:>10.0f} {error:>7.2f}%")
 
-        # 마지막 예측 결과 가져오기 (가장 최근 예측)
-        last_prediction = predictions[-1]
+    # 전체 예측 성능 지표
+    mae = mean_absolute_error(target_prices, last_prediction)
+    mse = mean_squared_error(target_prices, last_prediction)
+    rmse = np.sqrt(mse)
+    mape = np.mean(np.abs(error_rates))
 
-        # 예측 결과를 원래 스케일로 변환
-        last_prediction = scaler.inverse_transform_price(last_prediction.reshape(-1, 1)).flatten()
+    print("\n[전체 예측 성능]")
+    print(f"MAE: {mae:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}%")
 
-        # 실제 값과 예측 값 비교
-        target_dates = ['2025-03-21', '2025-03-24', '2025-03-25', '2025-03-26', '2025-03-27']
-        target_prices = [69700, 67500, 67200, 66800, 65700]
-
-        # 예측 결과 시각화
-        plt.figure(figsize=(12, 6))
-
-        # 날짜를 datetime 객체로 변환
-        dates = [datetime.strptime(date, '%Y-%m-%d') for date in target_dates]
-
-        # 실제 가격과 예측 가격 플롯
-        plt.plot(dates, target_prices, 'b-', label='실제 가격', marker='o')
-        plt.plot(dates, last_prediction, 'r--', label='예측 가격', marker='s')
-
-        # 그래프 스타일링
-        plt.title('LG전자 주가 예측 결과 (2025년 3월)', fontsize=14)
-        plt.xlabel('날짜', fontsize=12)
-        plt.ylabel('주가 (원)', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=12)
-
-        # x축 날짜 포맷 설정
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        plt.gca().xaxis.set_major_locator(mdates.DayLocator())
-        plt.xticks(rotation=45)
-
-        # 오차율 계산 및 표시
-        error_rates = [(pred - actual) / actual * 100 for pred, actual in zip(last_prediction, target_prices)]
-        for i, (date, error) in enumerate(zip(dates, error_rates)):
-            plt.annotate(f'{error:.2f}%',
-                        xy=(date, max(last_prediction[i], target_prices[i])),
-                        xytext=(0, 10),
-                        textcoords='offset points',
-                        ha='center',
-                        fontsize=10)
-
-        plt.tight_layout()
-        plt.show()
-
-        # 예측 결과 상세 분석
-        print("\n[예측 결과 분석]")
-        print(f"{'날짜':<12} {'실제 가격':>10} {'예측 가격':>10} {'오차율':>8}")
-        print("-" * 45)
-        for date, actual, pred, error in zip(target_dates, target_prices, last_prediction, error_rates):
-            print(f"{date:<12} {actual:>10,d} {pred:>10.0f} {error:>7.2f}%")
-
-        # 전체 예측 성능 지표
-        mae = mean_absolute_error(target_prices, last_prediction)
-        mse = mean_squared_error(target_prices, last_prediction)
-        rmse = np.sqrt(mse)
-        mape = np.mean(np.abs(error_rates))
-
-        print("\n[전체 예측 성능]")
-        print(f"MAE: {mae:.2f}")
-        print(f"RMSE: {rmse:.2f}")
-        print(f"MAPE: {mape:.2f}%")
-
-    except Exception as e:
-        print(f"예측 결과 분석 중 오류 발생: {e}")
-        raise
-
-    # 모델 학습 후 저장
-    try:
-        # 모델 학습
-        history = model.fit(
-            X_train, y_train,
-            validation_data=(X_test, y_test),
-            epochs=500,
-            batch_size=BATCH_SIZE,
-            callbacks=callbacks,
-            verbose=1,
-            shuffle=True
+    # 예측 결과 저장
+    for i, (date, pred, actual) in enumerate(zip(target_dates, last_prediction, target_prices)):
+        save_prediction(
+            stock_code='066570',  # LG전자 종목코드
+            stock_name='LG전자',
+            prediction_date=datetime.now(),
+            target_date=datetime.strptime(date, '%Y-%m-%d'),
+            predicted_price=pred,
+            actual_price=actual
         )
-
-        # 모델 저장
-        model.save('/content/drive/MyDrive/stock_prediction_model.h5')
-        
-        # 모델을 TensorFlow Lite 형식으로 변환
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_types = [tf.float16]
-        tflite_model = converter.convert()
-        
-        # TFLite 모델 저장
-        with open('/content/drive/MyDrive/stock_prediction_model.tflite', 'wb') as f:
-            f.write(tflite_model)
-        
-        # 모델 메타데이터 저장
-        import json
-        model_metadata = {
-            'input_shape': X_train.shape[1:],
-            'output_days': 5,
-            'price_scaler_params': {
-                'scale_': scaler.price_scaler.scale_.tolist(),
-                'center_': scaler.price_scaler.center_.tolist()
-            }
-        }
-        
-        with open('/content/drive/MyDrive/model_metadata.json', 'w') as f:
-            json.dump(model_metadata, f)
-        
-        print("모델 저장 완료")
-        print("TFLite 모델 저장 완료")
-        print("메타데이터 저장 완료")
-
-    except Exception as e:
-        print(f"모델 저장 중 오류 발생: {e}")
-        raise
+    
+    print("✅ 예측 결과가 데이터베이스에 저장되었습니다.")
 
 except Exception as e:
-    print(f"모델 학습 중 오류 발생: {e}")
+    print(f"예측 결과 분석 중 오류 발생: {e}")
     raise
+
+if __name__ == "__main__":
+    print("📢 주가 예측 모델 학습을 시작합니다...")
+    create_predictions_table()
+    
+    # 데이터 로드
+    stock_data, sentiment_data, economic_data = load_data_from_db()
+    
+    # 데이터 전처리 및 모델 학습
+    # ... (기존 코드 유지) ...
+    
+    # 예측 결과 저장
+    for i, (date, pred, actual) in enumerate(zip(target_dates, last_prediction, target_prices)):
+        save_prediction(
+            stock_code='066570',  # LG전자 종목코드
+            stock_name='LG전자',
+            prediction_date=datetime.now(),
+            target_date=datetime.strptime(date, '%Y-%m-%d'),
+            predicted_price=pred,
+            actual_price=actual
+        )
+    
+    print("✅ 예측 결과가 데이터베이스에 저장되었습니다.")

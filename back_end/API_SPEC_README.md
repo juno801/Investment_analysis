@@ -175,6 +175,39 @@ Authorization: Bearer {JWT_TOKEN}
 
 ---
 
+## 💼 뉴스 관련 API
+
+### 7. 💰 뉴스 조회
+- **Method:** `GET`
+- **URL:** `/api/news`
+- **설명:** 네이버 API를 이용한 키워드기반 뉴스 조회
+
+#### 📥 요청 헤더
+```
+Authorization: Bearer {JWT_TOKEN}
+```
+
+#### 📤 응답 예시
+```json
+{
+  "lastBuildDate": "Thu, 10 Apr 2025 14:47:40 +0900",       // api 요청 시간 (lastBuildDate)
+  "total": "3897511",      // 검색된 기사 갯수 (total)
+  "items": [                           // 기사 현황
+    {
+      "title": "반도체·부품사 1분기 호실적에도 웃지 못하는 이유는",          // 기사 제목 (title)
+      "link": "https://n.news.naver.com/mnews/article/119/0002943799?sid=101",        // 기사 링크 (link)
+      "description": "10일 업계에 따르면, <b>삼성전자</b>는 최근 1분기 잠정 영업익 6조6000억원을 기록했다. 이번 잠정 1분기 실적은 지난 7일 기준 영업익 컨센서스(증권사 3개월 추정치 평균)인 4조9613억원을 1조6000억원 이상 웃돌았다. 실적 발표를... ",        // 기사 요약 (description)
+    },
+    ...
+  ]
+}
+```
+
+#### 🔒 인증 필요 여부
+> ✅ 인증 필요 (JWT)
+
+---
+
 ## 🧾 비고
 
 - 모든 요청은 `application/json` 헤더를 포함해야 합니다.
@@ -185,5 +218,5 @@ Authorization: Bearer {JWT_TOKEN}
 
 ---
 
-🛠 작성일: 2025.03.26  
+🛠 작성일: 2025.04.10  
 👨‍💻 담당자: 백엔드 개발 - 박준오
