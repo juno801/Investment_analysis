@@ -9,6 +9,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -17,6 +19,7 @@ import java.util.Map;
 @Service
 public class AssetService {
 	private final ObjectMapper objectMapper;
+	private static final DateTimeFormatter DF = DateTimeFormatter.ofPattern("yyyyMMdd");
 
 	@Value("${kiwoom.appkey}")
 	private String appKey;
@@ -35,6 +38,9 @@ public class AssetService {
 
 	@Value("${securities.api.account-endpoint}")
 	private String accountEndpoint;
+
+	@Value("${securities.api.chart-endpoint}")
+	private String chartEndpoint;
 
 	public AssetService(RestTemplate restTemplate) {
 		this.restTemplate = restTemplate;
@@ -110,5 +116,63 @@ public class AssetService {
 		}
 
 		return new AccountEvaluationResponseDTO(d2_entra, tot_est_amt, tot_pur_amt, lspft, lspft_rt, stocks);
+	}
+
+	public ChartResponseDTO getDailyChart(String token, String stockCode) {
+		String url = baseUrl + chartEndpoint; // API URL 설정
+		String contYn = "Y";
+		String nextKey = "";
+		List<ChartResponseDTO.ChartData> allData = new ArrayList<>();
+		ChartResponseDTO combined = null;
+
+		while ("Y".equals(contYn)) {
+			try {
+				Thread.sleep(1000);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			    throw new RuntimeException("Sleep 중 인터럽트 발생", e);
+			}
+			
+			// 요청 헤더 설정
+			HttpHeaders headers = new HttpHeaders();
+			headers.setContentType(MediaType.APPLICATION_JSON);
+			headers.setBearerAuth(token); // "Authorization: Bearer {token}"
+			headers.add("cont-yn", contYn); // 연속조회 여부
+			headers.add("next-key", nextKey); // 연속조회 키
+			headers.add("api-id", "ka10081"); // TR명
+
+			// 요청 바디(JSON 데이터)
+			Map<String, String> requestBody = new HashMap<>();
+			requestBody.put("stk_cd", stockCode);
+			requestBody.put("base_dt", LocalDate.now().format(DF));
+			requestBody.put("upd_stkpc_tp", "1");
+
+			// HTTP 요청 생성
+			HttpEntity<Map<String, String>> request = new HttpEntity<>(requestBody, headers);
+
+			ResponseEntity<ChartResponseDTO> response = restTemplate.exchange(url, HttpMethod.POST, request,
+					ChartResponseDTO.class);
+
+			ChartResponseDTO page = response.getBody();
+			HttpHeaders rh = response.getHeaders();
+
+			if (combined == null) {
+				combined = new ChartResponseDTO();
+				combined.setStockCode(page.getStockCode());
+			}
+
+			allData.addAll(page.getChartData());
+
+			contYn = rh.getFirst("cont-yn");
+			nextKey = rh.getFirst("next-key");
+			if (contYn == null)
+				contYn = "N";
+			if (nextKey == null)
+				nextKey = "";
+		}
+
+		combined.setChartData(allData);
+		return combined;
+
 	}
 }

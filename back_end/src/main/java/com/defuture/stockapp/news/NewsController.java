@@ -4,7 +4,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api")
+@RequestMapping("/api/news")
 public class NewsController {
 	private final NewsService newsService;
 	
@@ -12,7 +12,7 @@ public class NewsController {
         this.newsService = newsService;
     }
 	
-	@GetMapping("/news")
+	@GetMapping("")
     public ResponseEntity<?> searchNews(@RequestParam("query") String query) {
         NewsResponseDTO result = newsService.searchNews(query);
         return ResponseEntity.ok(result);

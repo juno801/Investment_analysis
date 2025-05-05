@@ -4,7 +4,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api")
+@RequestMapping("/api/assets")
 public class AssetController {
 
 	private final AssetService assetService;
@@ -13,10 +13,18 @@ public class AssetController {
 		this.assetService = assetService;
 	}
 
-	@GetMapping("/assets")
+	@GetMapping("")
 	public ResponseEntity<?> getAccountEvaluation() { // @RequestHeader("Authorization") String token
 		String accessToken = assetService.getAccessToken();
 		AccountEvaluationResponseDTO response = assetService.getAccountEvaluation(accessToken);
+		System.out.println("assets");
+		return ResponseEntity.ok(response);
+	}
+	
+	@GetMapping("/{stkCd}")
+	public ResponseEntity<ChartResponseDTO> getDailyChart(@PathVariable("stkCd") String stockCode) { // @RequestHeader("Authorization") String token
+		String accessToken = assetService.getAccessToken();
+		ChartResponseDTO response = assetService.getDailyChart(accessToken, stockCode);
 
 		return ResponseEntity.ok(response);
 	}
