@@ -175,9 +175,43 @@ Authorization: Bearer {JWT_TOKEN}
 
 ---
 
+### 7. 💰 개별 종목 차트 정보 조회
+- **Method:** `GET`
+- **URL:** `/api/assets/{stkCd}`
+- **설명:** 요청한 종목 코드(stkCd)에 해당하는 차트 정보를 조회
+
+#### 📥 요청 헤더
+```
+Authorization: Bearer {JWT_TOKEN}
+```
+
+#### 📤 응답 예시
+```json
+{
+    "stk_cd": "138040",
+    "stk_dt_pole_chart_qry": [
+        {
+            "cur_prc": "122600",        //현재가
+            "trde_qty": "211656",       //거래량
+            "trde_prica": "26052",      //거래대금
+            "dt": "20250502",           //일자
+            "open_pric": "121700",      //시가
+            "high_pric": "124500",      //고가
+            "low_pric": "121600"        //저가
+        },
+        ...
+    ]
+}
+```
+
+#### 🔒 인증 필요 여부
+> ✅ 인증 필요 (JWT)
+
+---
+
 ## 💼 뉴스 관련 API
 
-### 7. 💰 뉴스 조회
+### 8. 💰 뉴스 조회
 - **Method:** `GET`
 - **URL:** `/api/news`
 - **설명:** 네이버 API를 이용한 키워드기반 뉴스 조회
@@ -218,5 +252,5 @@ Authorization: Bearer {JWT_TOKEN}
 
 ---
 
-🛠 작성일: 2025.04.10  
+🛠 작성일: 2025.05.5  
 👨‍💻 담당자: 백엔드 개발 - 박준오
